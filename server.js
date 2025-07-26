@@ -1,4 +1,4 @@
-// server.js (ฉบับแก้ไขสมบูรณ์)
+// server.js (Ultimate Version - Handles Image URLs)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -18,12 +18,10 @@ app.use(bodyParser.json());
 const VERIFY_TOKEN = process.env.MESSENGER_VERIFY_TOKEN;
 const PORT = process.env.PORT || 3000;
 
-// ฟังก์ชันสำหรับดึง Token ของแต่ละเพจ
 function getTokenForPage(pageId) {
   const token = process.env[`PAGE_TOKEN_${pageId}`];
   if (!token) {
     console.error(`[Error] ไม่พบ Access Token สำหรับ Page ID: ${pageId} ในไฟล์ .env`);
-    console.error(`กรุณาตั้งค่าตัวแปรชื่อ PAGE_TOKEN_${pageId}`);
   }
   return token;
 }
@@ -45,14 +43,11 @@ async function getUserProfile(userId, pageId) {
     }
 }
 
-// --- Endpoint สำหรับดึงข้อมูลเพจทั้งหมด (แก้ไขโครงสร้างข้อมูลที่ส่งกลับ) ---
 app.get('/pages-info', async (req, res) => {
     const pageTokenKeys = Object.keys(process.env).filter(key => key.startsWith('PAGE_TOKEN_'));
     if (pageTokenKeys.length === 0) {
-        console.warn("[Warning] ไม่พบ Page Access Token ใดๆ ในไฟล์ .env (ตัวแปรต้องขึ้นต้นด้วย 'PAGE_TOKEN_')");
         return res.json([]);
     }
-    
     const pageInfoPromises = pageTokenKeys.map(async (key) => {
         const pageId = key.replace('PAGE_TOKEN_', '');
         const accessToken = process.env[key];
@@ -60,18 +55,12 @@ app.get('/pages-info', async (req, res) => {
             const response = await axios.get(`https://graph.facebook.com/${pageId}`, {
                 params: { fields: 'name,picture{url}', access_token: accessToken }
             });
-            // **แก้ไขจุดนี้:** ปรับโครงสร้างให้ตรงกับที่ Frontend ต้องการ
-            return {
-                id: pageId,
-                name: response.data.name,
-                picture: response.data.picture // ส่งกลับทั้ง object picture
-            };
+            return { id: pageId, name: response.data.name, picture: response.data.picture };
         } catch (error) {
             console.error(`[Error] ไม่สามารถดึงข้อมูลของ Page ID ${pageId}:`, error.response ? error.response.data.error.message : error.message);
             return null;
         }
     });
-
     try {
         const pagesInfo = (await Promise.all(pageInfoPromises)).filter(p => p !== null);
         res.json(pagesInfo);
@@ -79,7 +68,6 @@ app.get('/pages-info', async (req, res) => {
         res.status(500).json({ error: 'เกิดข้อผิดพลาดในการดึงข้อมูลเพจ' });
     }
 });
-
 
 io.on('connection', (socket) => {
   console.log('[Info] A user connected to WebSocket:', socket.id);
@@ -98,29 +86,25 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// --- Webhook หลัก (แก้ไขโครงสร้างข้อมูลที่ส่งออก) ---
 app.post('/webhook', async (req, res) => {
   const body = req.body;
   if (body.object === 'page') {
     for (const entry of body.entry) {
       const webhookEvent = entry.messaging[0];
-      if (webhookEvent.message) { // ตรวจสอบว่ามี message event จริงๆ
+      // ตรวจสอบว่ามี message event และไม่ใช่ข้อความจากเพจเอง
+      if (webhookEvent.message && !webhookEvent.message.is_echo) {
         const senderId = webhookEvent.sender.id;
         const pageId = webhookEvent.recipient.id;
-        
         const userProfile = await getUserProfile(senderId, pageId);
         
-        // **แก้ไขจุดนี้:** สร้าง object ใหม่ตามโครงสร้างที่ Frontend ต้องการ
+        const messagePayload = webhookEvent.message;
         const eventData = {
             pageId: pageId,
-            sender: {
-                id: senderId,
-                name: userProfile.name,
-                profile_pic: userProfile.profile_pic
-            },
+            sender: { id: senderId, name: userProfile.name, profile_pic: userProfile.profile_pic },
             message: {
-                mid: webhookEvent.message.mid,
-                text: webhookEvent.message.text,
+                mid: messagePayload.mid,
+                text: messagePayload.text, // จะเป็น undefined ถ้าเป็นรูปภาพ
+                attachments: messagePayload.attachments, // จะมีข้อมูลถ้าเป็นรูปภาพ
                 timestamp: webhookEvent.timestamp
             }
         };
@@ -135,10 +119,9 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// --- Endpoint สำหรับส่งข้อความ (แก้ไขการรับค่า) ---
+// --- Endpoint สำหรับส่งข้อความ (อัปเกรดให้ส่งรูปได้) ---
 app.post('/send-message', async (req, res) => {
-    // **แก้ไขจุดนี้:** เปลี่ยน recipientId -> psid และ messageText -> message ให้ตรงกับที่ Frontend ส่งมา
-    const { psid, message, pageId } = req.body;
+    const { psid, message, pageId, messageType = 'text' } = req.body;
 
     if (!psid || !message || !pageId) {
         return res.status(400).send('Missing required fields: psid, message, pageId');
@@ -149,9 +132,24 @@ app.post('/send-message', async (req, res) => {
         return res.status(500).send(`Token for page ${pageId} not configured.`);
     }
 
+    let messageData;
+    if (messageType === 'image') {
+        messageData = {
+            attachment: {
+                type: 'image',
+                payload: {
+                    url: message,
+                    is_reusable: true
+                }
+            }
+        };
+    } else {
+        messageData = { text: message };
+    }
+
     const requestBody = { 
         recipient: { id: psid }, 
-        message: { text: message }, 
+        message: messageData, 
         messaging_type: 'RESPONSE' 
     };
 
